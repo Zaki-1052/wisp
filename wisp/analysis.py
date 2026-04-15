@@ -91,7 +91,7 @@ def analyze_shortest_paths(
         f"avg path length {avg_path_length:.4f}"
     )
 
-    return {
+    results = {
         "average_path_length": avg_path_length,
         "hub_nodes": list(hub_nodes.keys()),
         "critical_edges": list(critical_edges.keys()),
@@ -99,6 +99,8 @@ def analyze_shortest_paths(
         "detailed_node_usage": node_usage,
         "detailed_edge_usage": edge_usage,
     }
+    
+    return results
 
 
 def _write_path_lengths(output_dir, avg_path_length, distribution):
