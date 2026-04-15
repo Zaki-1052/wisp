@@ -94,6 +94,17 @@ class ContextManager:
         self.write_formatted_paths: bool = False
         """Write a text file containing a simply formatted list of paths.
         """
+        self.analyze: bool = False
+        """Run all-pairs shortest path network analysis after path finding."""
+        self.path_usage_threshold: float = 0.1
+        """Fraction of all shortest paths an edge must appear in to be reported
+        in usage analysis."""
+        self.centrality_threshold: float = 0.1
+        """Fraction of all shortest paths a node must appear in to be considered
+        a hub node."""
+        self.edge_criticality_threshold: float = 0.1
+        """Fraction of all shortest paths an edge must appear in to be considered
+        a critical edge."""
         self.shortest_path_radius: float = 0.1
         """WISP outputs a VMD state file to facilitate visualization. The shortest path
         is represented by a strand with the largest radius. Longer paths have

@@ -20,6 +20,12 @@ def setup_cli_interface(context_manager: ContextManager) -> argparse.ArgumentPar
                 nargs="+",
                 required=True,
             )
+        elif attr == "analyze":
+            parser.add_argument(
+                f"--{attr}",
+                action="store_true",
+                help="Run all-pairs shortest path network analysis",
+            )
         else:
             parser.add_argument(
                 f"--{attr}", type=arg_type, help=f"Set {attr} (current value: {value})"

@@ -61,7 +61,27 @@ You may use the `wisp` command-line interface as shown below.
 wisp tests/files/trajectory_20_frames.pdb --source_residues C_LEU_10 --sink_residues C_ASP_11
 ```
 
-Or, you may use wisp as a library in Python.
+### Network Analysis
+
+Use the `--analyze` flag to run an all-pairs shortest path analysis on the
+correlation network. This computes shortest paths between every node pair and
+identifies hub nodes and critical edges.
+
+```bash
+wisp tests/files/trajectory_20_frames.pdb \
+  --source_residues C_LEU_10 \
+  --sink_residues C_ASP_11 \
+  --analyze \
+  --centrality_threshold 0.1 \
+  --edge_criticality_threshold 0.1
+```
+
+This produces five additional output files in the output directory (see
+[Program Output](#program-output) for details).
+
+### Python API
+
+You may also use wisp as a library in Python.
 
 ```python
 from wisp.run import run_wisp
@@ -74,6 +94,15 @@ context_manager.source_residues = ["C_LEU_10"]
 context_manager.sink_residues = ["C_ASP_11"]
 
 # Run wisp
+paths = run_wisp(context_manager)
+```
+
+To run network analysis from Python:
+
+```python
+context_manager.analyze = True
+context_manager.centrality_threshold = 0.1
+context_manager.edge_criticality_threshold = 0.1
 paths = run_wisp(context_manager)
 ```
 
@@ -147,6 +176,17 @@ descriptions of each:
   first column contains the lengths, and all following columns contain node
   indices. This file may be helpful for subsequent statistical analyses of the
   WISP output. Note that the `simply_formatted_paths.txt` output file reindexes the residues. See the `visualize.tcl` file instead for a more human-readable output.
+
+The following files are generated when using the `--analyze` flag:
+
+- `path_lengths.txt`: Average path length and path length distribution
+  (histogram) across all node pairs.
+- `node_usage.txt`: Usage count for each node across all shortest paths.
+- `edge_usage.txt`: Usage count for each edge across all shortest paths.
+- `critical_edges.txt`: Edges that appear in more than
+  `--edge_criticality_threshold` fraction of all shortest paths.
+- `hub_nodes.txt`: Nodes that appear in more than `--centrality_threshold`
+  fraction of all shortest paths.
 
 ## Deploying
 

@@ -2,9 +2,11 @@ import os
 import pickle
 import time
 
+import networkx as nx
 import numpy as np
 from loguru import logger
 
+from .analysis import analyze_shortest_paths, calculate_all_shortest_paths
 from .cli import run_cli
 from .contexts import ContextManager
 from .io import output_dir_info
@@ -60,6 +62,18 @@ def run_wisp(context_manager: ContextManager) -> None:
         context,
         correlation_matrix_object.average_pdb.residue_identifiers_in_order,
     )
+
+    # run all-pairs network analysis if requested
+    if context["analyze"]:
+        G = nx.Graph(incoming_graph_data=correlation_matrix)
+        all_paths = calculate_all_shortest_paths(G)
+        analyze_shortest_paths(
+            all_paths,
+            context["output_dir"],
+            path_usage_threshold=context["path_usage_threshold"],
+            centrality_threshold=context["centrality_threshold"],
+            edge_criticality_threshold=context["edge_criticality_threshold"],
+        )
 
     # create the visualization
     Visualize(context, correlation_matrix_object, paths)
