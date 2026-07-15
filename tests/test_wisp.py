@@ -94,5 +94,9 @@ def test_issue_5():
     context_manager.source_residues = ["C_PLP_645"]
     context_manager.n_cores = 1
 
-    with pytest.raises(SystemExit):
+    # This PDB has no chain IDs, so WISP infers them: the requested residues
+    # resolve to A_PLP_645 and E_PLP_1449, and chain C holds neither. Looking up
+    # a residue that is not in the structure is reported and re-raised by
+    # GetCovarianceMatrix.convert_list_of_residue_keys_to_residue_indices.
+    with pytest.raises(IndexError):
         run_wisp(context_manager)
