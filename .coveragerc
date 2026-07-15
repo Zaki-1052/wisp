@@ -3,7 +3,7 @@ branch = true
 source = tests
 
 [paths]
-source = vaxstats
+source = wisp
 
 [report]
 fail_under = 75
