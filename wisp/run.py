@@ -15,15 +15,15 @@ from .utils import GetCovarianceMatrix
 from .viz import Visualize
 
 
-def run_wisp(context_manager: ContextManager) -> None:
+def run_wisp(context_manager: ContextManager) -> list:
     context = context_manager.get()
     program_start_time = time.time()
 
     # compute the correlation matrix
     if context["wisp_saved_matrix_path"] is not None:
-        correlation_matrix_object = pickle.load(
-            open(context["wisp_saved_matrix_path"], "rb")
-        )  # load the matrix instead of generating
+        # load the matrix instead of generating
+        with open(context["wisp_saved_matrix_path"], "rb") as f:
+            correlation_matrix_object = pickle.load(f)
     else:
         correlation_matrix_object = GetCovarianceMatrix(
             context
@@ -35,16 +35,12 @@ def run_wisp(context_manager: ContextManager) -> None:
     correlation_matrix[np.diag_indices(correlation_matrix.shape[0])] = 0.0
 
     # always save a copy of the correlation matrix, regardless of how it was loaded/generated
-    pickle.dump(
-        correlation_matrix_object,
-        open(
-            os.path.join(
-                context["output_dir"],
-                "functionalized_matrix_with_contact_map_applied.pickle",
-            ),
-            "wb",
-        ),
+    saved_matrix_path = os.path.join(
+        context["output_dir"],
+        "functionalized_matrix_with_contact_map_applied.pickle",
     )
+    with open(saved_matrix_path, "wb") as f:
+        pickle.dump(correlation_matrix_object, f)
 
     # now get the source and sink locations from the parameters
     sources = correlation_matrix_object.convert_list_of_residue_keys_to_residue_indices(
@@ -66,7 +62,7 @@ def run_wisp(context_manager: ContextManager) -> None:
     # run all-pairs network analysis if requested
     if context["analyze"]:
         G = nx.Graph(incoming_graph_data=correlation_matrix)
-        all_paths = calculate_all_shortest_paths(G)
+        all_paths = calculate_all_shortest_paths(G, n_cores=context["n_cores"])
         analyze_shortest_paths(
             all_paths,
             context["output_dir"],
