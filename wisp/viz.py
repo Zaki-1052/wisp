@@ -34,7 +34,7 @@ class Visualize:
         """Get paths between a single sink and a single source
 
         Args:
-            context: the user-specified command-line parameters, a UserInput object
+            context: the WISP context dictionary
             residue_keys: a list containing string representations of each residue ("CHAIN_RESNAME_RESID")
             node_locs: a dictionary, mapping string representations of each residue to a np.array representation
                 of the node location
