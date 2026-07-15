@@ -6,6 +6,7 @@ import os
 import sys
 import time
 from collections.abc import Collection, MutableMapping
+from collections import Counter
 
 import networkx as nx
 import numpy as np
@@ -243,6 +244,10 @@ class GetPaths:
         logger.info(
             f"The shortest path has length {str(shortest_length)}",
         )
+
+        # calculate the shortest path between all pairs of nodes in the graph
+        self.all_paths = self.calculate_all_shortest_paths(self.corr_matrix, G)
+        self.analysis_results = self.analyze_shortest_paths(self.all_paths)
 
         path = [shortest_length]
         path.extend(shortest_path)
@@ -596,3 +601,90 @@ class GetPaths:
             pths.append(full_path_from_start_to_sink)
 
         return pths
+    
+    ### SHORTEST PATH METHOD ### 
+
+    def calculate_all_shortest_paths(self, G):
+        """Calculate the shortest path between all pairs of nodes in the graph.
+    
+        Arguments: 
+        corr_matrix -- a numpy.array, the calculated correlation matrix
+        G -- a networkx.Graph object describing the connectivity of the nodes
+    
+        Returns a dictionary with node pairs as keys and tuples containing the path length and path as values.
+        """
+        all_paths = {}
+        length_paths = dict(nx.all_pairs_dijkstra_path_length(G, weight="weight"))
+        path_paths = dict(nx.all_pairs_dijkstra_path(G, weight="weight"))
+
+        for source, lengths in length_paths.items():
+            for sink, length in lengths.items():
+                if source != sink:
+                    path = path_paths[source][sink]
+                   # print(source,sink,path)
+                    all_paths[(source, sink)] = (length, path)
+
+        return all_paths
+
+    def analyze_shortest_paths(self, all_paths, path_usage_threshold=0.1, centrality_threshold=0.1, edge_criticality_threshold=0.1):
+        """Analyze the collected shortest path data with thresholds to extract refined insights and write to files.
+        Arguments:
+        all_paths -- a dictionary with node pairs as keys and tuples (path length, path) as values.
+        path_usage_threshold -- the percentage (0-1) of paths that must include an edge for it to be considered critical
+        centrality_threshold -- the percentage (0-1) of paths that must pass through a node for it to be considered a hub
+        edge_criticality_threshold -- the percentage (0-1) of paths that must include an edge for it to be considered critical
+        Returns a dictionary of analysis results with threshold considerations.
+        """
+        edge_usage = Counter()
+        node_usage = Counter()
+        path_lengths = []
+        total_paths = len(all_paths)
+
+        # Analyze all paths
+        for (src, sink), (length, path) in all_paths.items():
+            if path:  # Ensure there is a valid path
+                path_lengths.append(length)
+                node_usage.update(path)
+                for start, end in zip(path[:-1], path[1:]):
+                    edge_usage[(start, end)] += 1
+
+        # Apply thresholds
+        critical_edges = {k: v for k, v in edge_usage.items() if v / total_paths > edge_criticality_threshold}
+        hub_nodes = {k: v for k, v in node_usage.items() if v / total_paths > centrality_threshold}
+
+        # Calculate statistics
+        avg_path_length = np.mean(path_lengths) if path_lengths else float('inf')
+        path_length_distribution = np.histogram(path_lengths, bins=10)
+
+        # Write outputs
+        with open('path_lengths.txt', 'w') as file:
+            file.write('Average Path Length: {}\n'.format(avg_path_length))
+            file.write('Path Length Distribution (histogram): {}\n'.format(path_length_distribution))
+
+        with open('node_usage.txt', 'w') as file:
+            for node, usage in node_usage.items():
+                file.write('Node {}: {}\n'.format(node, usage))
+
+        with open('edge_usage.txt', 'w') as file:
+            for edge, usage in edge_usage.items():
+                file.write('Edge {} -> {}: {}\n'.format(edge[0], edge[1], usage))
+
+        with open('critical_edges.txt', 'w') as file:
+            for edge in critical_edges.keys():
+                file.write('Critical Edge {} -> {}\n'.format(edge[0], edge[1]))
+
+        with open('hub_nodes.txt', 'w') as file:
+            for node in hub_nodes.keys():
+                file.write('Hub Node: {}\n'.format(node))
+
+        # Return results dictionary for in-memory use
+        results = {
+            'average_path_length': avg_path_length,
+            'hub_nodes': list(hub_nodes.keys()),
+            'critical_edges': list(critical_edges.keys()),
+            'path_length_distribution': path_length_distribution,
+            'detailed_node_usage': node_usage,
+            'detailed_edge_usage': edge_usage
+        }
+
+        return results
