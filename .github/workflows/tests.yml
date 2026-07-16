@@ -15,6 +15,11 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          # Every test fixture is a .pdb, and .gitattributes routes those through
+          # LFS. Without this the runner gets ~130-byte pointer files and the
+          # trajectory tests fail on unparseable input. codecov.yml already sets it.
+          lfs: true
 
       - name: Install pixi
         uses: prefix-dev/setup-pixi@v0.8.1
