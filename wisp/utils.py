@@ -8,7 +8,7 @@ from loguru import logger
 from scipy.spatial.distance import cdist
 
 from .structure import Molecule
-from .traj import collect_data_from_frames, multi_threading_to_collect_data_from_frames
+from .traj import FrameDataCollector, collect_data_from_frames_in_parallel
 
 
 class GetCovarianceMatrix:
@@ -32,7 +32,7 @@ class GetCovarianceMatrix:
         )
 
         if context["n_cores"] == 1:
-            load_frames_data = collect_data_from_frames()
+            load_frames_data = FrameDataCollector()
 
             # a pdb object that will eventually contain the average structure
             self.average_pdb = None
@@ -50,7 +50,7 @@ class GetCovarianceMatrix:
                     if len(this_frame) == 0:
                         break
 
-                    load_frames_data.value_func((context, this_frame))
+                    load_frames_data.add_frame((context, this_frame))
 
                     this_frame = []  # so deleted for next time
 
@@ -69,11 +69,10 @@ class GetCovarianceMatrix:
             # so more than one processor. Load in 100 frames, work on those.
             multiple_frames = []
 
-            # this will keep a tallied sum of the coordinates of each frame
-            # for subsequently calculating the average structure
-            total_coordinate_sum = None
-
-            dictionary_of_node_lists = {}
+            # this keeps a tallied sum of the coordinates of each frame for
+            # subsequently calculating the average structure, along with the node
+            # locations collected for each residue
+            collector = FrameDataCollector()
 
             # a pdb object that will eventually contain the average structure
             self.average_pdb = None
@@ -96,22 +95,12 @@ class GetCovarianceMatrix:
 
                     if number_of_frames % context["frame_chunks"] == 0:
                         # so you've collected 100 frames. Time to send them
-                        # off to the multiple processes. note that the results
-                        # are cumulative within the object.
-                        tmp = multi_threading_to_collect_data_from_frames(
-                            multiple_frames, context["n_cores"]
-                        ).combined_results
-
-                        if total_coordinate_sum is None:
-                            total_coordinate_sum = tmp[0]
-                            dictionary_of_node_lists = tmp[1]
-                        else:
-                            total_coordinate_sum = total_coordinate_sum + tmp[0]
-                            for key in tmp[1]:
-                                try:
-                                    dictionary_of_node_lists[key].extend(tmp[1][key])
-                                except Exception:
-                                    dictionary_of_node_lists[key] = tmp[1][key]
+                        # off to the multiple processes.
+                        collector.merge(
+                            collect_data_from_frames_in_parallel(
+                                multiple_frames, context["n_cores"]
+                            )
+                        )
 
                         # so you're done processing the 100 frames, start over
                         # with the next 100
@@ -123,19 +112,14 @@ class GetCovarianceMatrix:
             logger.info("Analyzing frames...")
 
             # you need to get the last chunk
-            tmp = multi_threading_to_collect_data_from_frames(
-                multiple_frames, context["n_cores"]
-            ).combined_results  # note that the results are cumulative within the object
-            if total_coordinate_sum is None:
-                total_coordinate_sum = tmp[0]
-                dictionary_of_node_lists = tmp[1]
-            else:
-                total_coordinate_sum = total_coordinate_sum + tmp[0]
-                for key in tmp[1]:
-                    try:
-                        dictionary_of_node_lists[key].extend(tmp[1][key])
-                    except Exception:
-                        dictionary_of_node_lists[key] = tmp[1][key]
+            collector.merge(
+                collect_data_from_frames_in_parallel(
+                    multiple_frames, context["n_cores"]
+                )
+            )
+
+            total_coordinate_sum = collector.summed_coordinates
+            dictionary_of_node_lists = collector.nodes
 
             self.average_pdb.coordinates = total_coordinate_sum / float(
                 number_of_frames

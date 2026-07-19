@@ -6,7 +6,7 @@ import os
 import sys
 import time
 from collections.abc import Collection, MutableMapping
-from collections import Counter
+from concurrent.futures import ProcessPoolExecutor
 
 import networkx as nx
 import numpy as np
@@ -34,179 +34,132 @@ def get_log_n_paths(graph, cutoff_length):
     return log_estimated_paths
 
 
-class multi_threading_find_paths:
-    """Launches path finding on multiple processors"""
+def expand_growing_paths_one_step(
+    paths_growing_out_from_source,
+    full_paths_from_start_to_sink,
+    cutoff,
+    sink,
+    G,
+):
+    """Expand the first path growing out from the source by one step, to the
+       neighbors of its terminal node.
 
-    results = []
+    The expanded path is removed from `paths_growing_out_from_source` and replaced
+    by one longer path per eligible neighbor, so repeated calls walk the whole tree.
 
-    def __init__(self, inputs: Collection, num_processors: int | None = None):
-        """
-        Args:
-            inputs: the data to be processed, in a list
-            num_processors: the number of processors to use to process this data.
-        """
+    Args:
+        paths_growing_out_from_source: a list of paths, where each path is
+            represented by a list. The first item in each path is the length of
+            the path (float). The remaining items are the indices of the nodes
+            in the path (int). Must not be empty.
+        full_paths_from_start_to_sink: a growing list of identified paths that
+            connect the source and the sink, where each path is formatted as above.
+        cutoff: a numpy array containing a single element (float), the length
+            cutoff. Paths with lengths greater than the cutoff will be ignored.
+        sink: the index of the sink (int)
+        G: a nx.Graph object describing the connectivity of the different nodes
+    """
 
-        self.results = []
+    path = paths_growing_out_from_source.pop(0)
 
-        # First, we determine the number of available cores.
-        if num_processors is None:
-            num_processors = mp.cpu_count()
-        # reduce the number of processors if too many have been specified
-        if len(inputs) < num_processors:
-            logger.debug("Number of cores is higher than number of inputs.")
-            num_processors = len(inputs)
-            if num_processors == 0:
-                num_processors = 1
-        logger.debug(f"Setting the number of cores to {num_processors}")
+    if path[0] > cutoff:
+        # Because if the path is already greater than the cutoff, no use
+        # continuing to branch out, since subsequent branches will be longer.
+        return
 
-        # now, divide the inputs into the appropriate number of processors
-        inputs_divided: MutableMapping[str, Collection] = {
-            t: [] for t in range(num_processors)
-        }
-        for t in range(0, len(inputs), num_processors):
-            for t2 in range(num_processors):
-                index = t + t2
-                if index < len(inputs):
-                    inputs_divided[t2].append(inputs[index])
+    if path[-1] == sink:
+        full_paths_from_start_to_sink.append(path)
+        return
 
-        # now, run each division on its own processor
-        running = mp.Value("i", num_processors)
-        mutex = mp.Lock()
-
-        arrays = []
-        threads = []
-        for _ in range(num_processors):
-            threads.append(find_paths())
-            arrays.append(mp.Array("i", [0, 1]))
-
-        results_queue = mp.Queue()  # to keep track of the results
-
-        processes = []
-        for i in range(num_processors):
-            p = mp.Process(
-                target=threads[i].runit,
-                args=(running, mutex, results_queue, inputs_divided[i]),
+    # Sink not yet reached, but paths still short enough. So add new paths, same
+    # as old, but with neighboring element appended.
+    for i, node_neighbor in enumerate(G.neighbors(path[-1])):
+        if node_neighbor not in path:
+            expanded_path = path[:]
+            expanded_path.append(node_neighbor)
+            expanded_path[0] = (
+                expanded_path[0]
+                + G.edges[expanded_path[-2], expanded_path[-1]]["weight"]
             )
-            p.start()
-            processes.append(p)
-
-        while running.value > 0:
-            continue  # wait for everything to finish
-
-        # compile all results
-        for _ in threads:
-            chunk = results_queue.get()
-            for chun in chunk:
-                self.results.extend(chun)
+            paths_growing_out_from_source.insert(i, expanded_path)
 
 
-class find_paths:  # other, more specific classes with inherit this one
-    """Path-finding data processing on a single processor"""
+# Populated in each worker process by _init_path_search_worker. Holding the search
+# parameters in a global means the graph is pickled once per worker rather than
+# once per branch.
+_PATH_SEARCH_CONTEXT: tuple | None = None
 
-    results = []
 
-    def runit(self, running, mutex, results_queue, items):
-        """Path-finding data processing on a single processor.
+def _init_path_search_worker(cutoff, sink, G) -> None:
+    """Store the search parameters in this worker process."""
+    global _PATH_SEARCH_CONTEXT  # pylint: disable=global-statement
+    _PATH_SEARCH_CONTEXT = (cutoff, sink, G)
 
-        Args:
-            running: a mp.Value() object
-            mutex: a mp.Lock() object
-            results_queue: where the results will be stored [mp.Queue()]
-            items: the data to be processed, in a list
-        """
 
-        for item in items:
-            self.value_func(item, results_queue)
-        mutex.acquire()
-        running.value -= 1
-        mutex.release()
-        results_queue.put(self.results)
+def _find_paths_from_branch(branch: list) -> list:
+    """Expand a single partial path until every full source-to-sink path is found.
 
-    def value_func(
-        self, item, results_queue
-    ):  # this is the function that changes through inheritance
-        """Process a single path-finding "branch"
+    Args:
+        branch: a list corresponding to a partial path. The first item is the
+            length of the path (float). The remaining items are the indices of
+            the nodes in the path (int).
 
-        Args:
-            item: a tuple containing required information.
-                The first is a numpy array containing a single float, the path-length cutoff
-                The second is an index corresponding to the ultimate path sink
-                The third is a nx.Graph object describing the connectivity of the different nodes
-                The fourth is a list corresponding to a path. The first item is the length of the path (float).
-                    The remaining items are the indices of the nodes in the path (int).
-            results_queue: where the results will be stored [mp.Queue()]
-        """
+    Returns:
+        A list of the full source-to-sink paths that grow out of this branch.
+    """
+    if _PATH_SEARCH_CONTEXT is None:
+        raise RuntimeError("Path-finding worker process was never given a graph.")
+    cutoff, sink, G = _PATH_SEARCH_CONTEXT
 
-        cutoff = item[0]
-        sink = item[1]
-        G = item[2]
+    paths_growing_out_from_source = [branch]
+    full_paths_from_start_to_sink: list = []
 
-        paths_growing_out_from_source = [item[3]]
-        full_paths_from_start_to_sink = []
+    while paths_growing_out_from_source:
+        expand_growing_paths_one_step(
+            paths_growing_out_from_source,
+            full_paths_from_start_to_sink,
+            cutoff,
+            sink,
+            G,
+        )
 
-        while paths_growing_out_from_source:
-            self.expand_growing_paths_one_step(
-                paths_growing_out_from_source,
-                full_paths_from_start_to_sink,
-                cutoff,
-                sink,
-                G,
-            )
+    return full_paths_from_start_to_sink
 
-        # here save the results for later compilation
-        self.results.append(full_paths_from_start_to_sink)
 
-    def expand_growing_paths_one_step(
-        self,
-        paths_growing_out_from_source,
-        full_paths_from_start_to_sink,
-        cutoff,
-        sink,
-        G,
-    ):
-        """Expand the paths growing out from the source to the sink by one step
-           (to the neighbors of the terminal node) of the expanding paths
+def find_paths_in_parallel(
+    branches: Collection, cutoff, sink, G, n_cores: int | None = None
+) -> list:
+    """Expand partial paths into full source-to-sink paths using multiple processes.
 
-        Args:
-            paths_growing_out_from_source: a list of paths, where each path is
-                represented by a list. The first item in each path is the length of
-                the path (float). The remaining items are the indices of the nodes
-                in the path (int).
-            full_paths_from_start_to_sink: a growing list of identified paths that
-                connect the source and the sink, where each path is formatted as above.
-            cutoff: a numpy array containing a single element (float), the length
-                cutoff. Paths with lengths greater than the cutoff will be ignored.
-            sink: the index of the sink (int)
-            G: a nx.Graph object describing the connectivity of the different nodes
-        """
+    Each branch is expanded independently, so they are handed out to worker
+    processes one at a time.
 
-        for i, path_growing_out_from_source in enumerate(paths_growing_out_from_source):
-            if path_growing_out_from_source[0] > cutoff:
-                # Because if the path is already greater than the cutoff, no
-                # use continuing to branch out, since subsequent branhes will
-                # be longer.
-                paths_growing_out_from_source.pop(i)
-                break
-            elif path_growing_out_from_source[-1] == sink:
-                # so the sink has been reached
-                full_paths_from_start_to_sink.append(path_growing_out_from_source)
-                paths_growing_out_from_source.pop(i)
-                break
-            elif path_growing_out_from_source[-1] != sink:
-                # sink not yet reached, but paths still short enough. So add
-                # new paths, same as old, but with neighboring element
-                # appended.
-                node_neighbors = list(G.neighbors(path_growing_out_from_source[-1]))
-                for j, node_neighbor in enumerate(node_neighbors):
-                    if not node_neighbor in path_growing_out_from_source:
-                        temp = path_growing_out_from_source[:]
-                        temp.append(node_neighbor)
-                        temp[0] = temp[0] + G.edges[temp[-2], temp[-1]]["weight"]
-                        paths_growing_out_from_source.insert((i + j + 1), temp)
-                paths_growing_out_from_source.pop(i)
-                break
-            else:
-                logger.critical("SOMETHING IS WRONG")
+    Args:
+        branches: the partial paths to expand, each a list whose first item is the
+            path length (float) and whose remaining items are node indices (int).
+        cutoff: a numpy array containing a single element (float), the length
+            cutoff. Paths with lengths greater than the cutoff will be ignored.
+        sink: the index of the sink (int)
+        G: a nx.Graph object describing the connectivity of the different nodes
+        n_cores: the number of processes to use. Defaults to every available core.
+
+    Returns:
+        A flat list of every full source-to-sink path found, where each path is
+        represented by a list. The first item is the length of the path (float).
+        The remaining items are the indices of the nodes in the path (int).
+    """
+    if n_cores is None:
+        n_cores = mp.cpu_count()
+    n_workers = max(1, min(n_cores, len(branches)))
+    logger.debug(f"Expanding {len(branches)} branches on {n_workers} cores")
+
+    with ProcessPoolExecutor(
+        max_workers=n_workers,
+        initializer=_init_path_search_worker,
+        initargs=(cutoff, sink, G),
+    ) as pool:
+        branch_results = pool.map(_find_paths_from_branch, branches)
+        return [path for branch_paths in branch_results for path in branch_paths]
 
 
 class GetPaths:
@@ -227,7 +180,7 @@ class GetPaths:
             corr_matrix: a np.array, the calculated correlation matrix
             srcs: a list of ints, the indices of the sources for path finding
             snks: a list of ints, the indices of the sinks for path finding
-            context: the user-specified command-line parameters, a UserInput object
+            context: the WISP context dictionary
             residue_keys: a list containing string representations of each residue
         """
         # populate graph nodes and weighted edges
@@ -244,10 +197,6 @@ class GetPaths:
         logger.info(
             f"The shortest path has length {str(shortest_length)}",
         )
-
-        # calculate the shortest path between all pairs of nodes in the graph
-        self.all_paths = self.calculate_all_shortest_paths(self.corr_matrix, G)
-        self.analysis_results = self.analyze_shortest_paths(self.all_paths)
 
         path = [shortest_length]
         path.extend(shortest_path)
@@ -442,7 +391,7 @@ class GetPaths:
             srcs: a list of ints, the indices of the sources for path finding
             snks: a list of ints, the indices of the sinks for path finding
             G: a nx.Graph object describing the connectivity of the different nodes
-            context: the user-specified command-line parameters, a UserInput object
+            context: the WISP context dictionary
 
         Returns:
             a list of paths, where each path is represented by a list. The first item in each path is the length
@@ -470,7 +419,7 @@ class GetPaths:
             source: the index of the source for path finding
             sink: the index of the sink for path finding
             G: a nx.Graph object describing the connectivity of the different nodes
-            context: the user-specified command-line parameters, a UserInput object
+            context: the WISP context dictionary
 
         Returns:
             a list of paths, where each path is represented by a list. The first item
@@ -541,10 +490,9 @@ class GetPaths:
         # To parallelize, just get the first N branches, and send them off to each node.
         # Rest of branches filled out in separate processes.
 
-        find_paths_object = find_paths()
         if context["n_cores"] == 1:
             while paths_growing_out_from_source:
-                find_paths_object.expand_growing_paths_one_step(
+                expand_growing_paths_one_step(
                     paths_growing_out_from_source,
                     full_paths_from_start_to_sink,
                     cutoff,
@@ -564,7 +512,7 @@ class GetPaths:
                 and time.time() - atime
                 < context["seconds_to_wait_before_parallelizing_path_finding"]
             ):
-                find_paths_object.expand_growing_paths_one_step(
+                expand_growing_paths_one_step(
                     paths_growing_out_from_source,
                     full_paths_from_start_to_sink,
                     cutoff,
@@ -579,14 +527,14 @@ class GetPaths:
                     + str(context["n_cores"])
                     + " processors...",
                 )
-                paths_growing_out_from_source = [
-                    (cutoff, sink, G, path) for path in paths_growing_out_from_source
-                ]
-                additional_full_paths_from_start_to_sink = multi_threading_find_paths(
-                    paths_growing_out_from_source, context["n_cores"]
-                )
                 full_paths_from_start_to_sink.extend(
-                    additional_full_paths_from_start_to_sink.results
+                    find_paths_in_parallel(
+                        paths_growing_out_from_source,
+                        cutoff,
+                        sink,
+                        G,
+                        context["n_cores"],
+                    )
                 )
             else:
                 logger.info(
@@ -601,90 +549,3 @@ class GetPaths:
             pths.append(full_path_from_start_to_sink)
 
         return pths
-    
-    ### SHORTEST PATH METHOD ### 
-
-    def calculate_all_shortest_paths(self, G):
-        """Calculate the shortest path between all pairs of nodes in the graph.
-    
-        Arguments: 
-        corr_matrix -- a numpy.array, the calculated correlation matrix
-        G -- a networkx.Graph object describing the connectivity of the nodes
-    
-        Returns a dictionary with node pairs as keys and tuples containing the path length and path as values.
-        """
-        all_paths = {}
-        length_paths = dict(nx.all_pairs_dijkstra_path_length(G, weight="weight"))
-        path_paths = dict(nx.all_pairs_dijkstra_path(G, weight="weight"))
-
-        for source, lengths in length_paths.items():
-            for sink, length in lengths.items():
-                if source != sink:
-                    path = path_paths[source][sink]
-                   # print(source,sink,path)
-                    all_paths[(source, sink)] = (length, path)
-
-        return all_paths
-
-    def analyze_shortest_paths(self, all_paths, path_usage_threshold=0.1, centrality_threshold=0.1, edge_criticality_threshold=0.1):
-        """Analyze the collected shortest path data with thresholds to extract refined insights and write to files.
-        Arguments:
-        all_paths -- a dictionary with node pairs as keys and tuples (path length, path) as values.
-        path_usage_threshold -- the percentage (0-1) of paths that must include an edge for it to be considered critical
-        centrality_threshold -- the percentage (0-1) of paths that must pass through a node for it to be considered a hub
-        edge_criticality_threshold -- the percentage (0-1) of paths that must include an edge for it to be considered critical
-        Returns a dictionary of analysis results with threshold considerations.
-        """
-        edge_usage = Counter()
-        node_usage = Counter()
-        path_lengths = []
-        total_paths = len(all_paths)
-
-        # Analyze all paths
-        for (src, sink), (length, path) in all_paths.items():
-            if path:  # Ensure there is a valid path
-                path_lengths.append(length)
-                node_usage.update(path)
-                for start, end in zip(path[:-1], path[1:]):
-                    edge_usage[(start, end)] += 1
-
-        # Apply thresholds
-        critical_edges = {k: v for k, v in edge_usage.items() if v / total_paths > edge_criticality_threshold}
-        hub_nodes = {k: v for k, v in node_usage.items() if v / total_paths > centrality_threshold}
-
-        # Calculate statistics
-        avg_path_length = np.mean(path_lengths) if path_lengths else float('inf')
-        path_length_distribution = np.histogram(path_lengths, bins=10)
-
-        # Write outputs
-        with open('path_lengths.txt', 'w') as file:
-            file.write('Average Path Length: {}\n'.format(avg_path_length))
-            file.write('Path Length Distribution (histogram): {}\n'.format(path_length_distribution))
-
-        with open('node_usage.txt', 'w') as file:
-            for node, usage in node_usage.items():
-                file.write('Node {}: {}\n'.format(node, usage))
-
-        with open('edge_usage.txt', 'w') as file:
-            for edge, usage in edge_usage.items():
-                file.write('Edge {} -> {}: {}\n'.format(edge[0], edge[1], usage))
-
-        with open('critical_edges.txt', 'w') as file:
-            for edge in critical_edges.keys():
-                file.write('Critical Edge {} -> {}\n'.format(edge[0], edge[1]))
-
-        with open('hub_nodes.txt', 'w') as file:
-            for node in hub_nodes.keys():
-                file.write('Hub Node: {}\n'.format(node))
-
-        # Return results dictionary for in-memory use
-        results = {
-            'average_path_length': avg_path_length,
-            'hub_nodes': list(hub_nodes.keys()),
-            'critical_edges': list(critical_edges.keys()),
-            'path_length_distribution': path_length_distribution,
-            'detailed_node_usage': node_usage,
-            'detailed_edge_usage': edge_usage
-        }
-
-        return results

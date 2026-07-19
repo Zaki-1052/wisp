@@ -1,31 +1,89 @@
 # wisp/analysis.py
 import os
 from collections import Counter
+from collections.abc import Iterable, Iterator
+from concurrent.futures import ProcessPoolExecutor
 
 import networkx as nx
 import numpy as np
 from loguru import logger
 
+SourceResult = tuple[int, dict[int, float], dict[int, list[int]]]
 
-def calculate_all_shortest_paths(G: nx.Graph) -> dict[tuple[int, int], tuple[float, list[int]]]:
+# Populated in each worker process by _init_dijkstra_worker. Holding the graph in a
+# global means it is pickled once per worker instead of once per source node.
+_WORKER_GRAPH: nx.Graph | None = None
+
+
+def _init_dijkstra_worker(graph: nx.Graph) -> None:
+    """Store the graph in this worker process for _single_source_dijkstra to use."""
+    global _WORKER_GRAPH  # pylint: disable=global-statement
+    _WORKER_GRAPH = graph
+
+
+def _single_source_dijkstra(source: int) -> SourceResult:
+    """Compute the shortest path from one source to every node it can reach.
+
+    Args:
+        source: Index of the node to search from.
+
+    Returns:
+        The source index, its map of sink index to path length, and its map of
+        sink index to path.
+    """
+    if _WORKER_GRAPH is None:
+        raise RuntimeError("Dijkstra worker process was never given a graph.")
+    lengths, paths = nx.single_source_dijkstra(_WORKER_GRAPH, source, weight="weight")
+    return source, lengths, paths
+
+
+def _all_pairs_dijkstra_serial(G: nx.Graph) -> Iterator[SourceResult]:
+    """Search from every source node on a single core."""
+    for source, (lengths, paths) in nx.all_pairs_dijkstra(G, weight="weight"):
+        yield source, lengths, paths
+
+
+def _assemble_all_paths(
+    results: Iterable[SourceResult],
+) -> dict[tuple[int, int], tuple[float, list[int]]]:
+    """Collect per-source Dijkstra results into a single source-sink lookup."""
+    all_paths = {}
+    for source, lengths, paths in results:
+        for sink, length in lengths.items():
+            if source != sink:
+                all_paths[(source, sink)] = (length, paths[sink])
+    return all_paths
+
+
+def calculate_all_shortest_paths(
+    G: nx.Graph, n_cores: int = 1
+) -> dict[tuple[int, int], tuple[float, list[int]]]:
     """Compute shortest paths between all node pairs using Dijkstra's algorithm.
+
+    Every source node is searched independently, so the work is split across
+    `n_cores` processes when more than one core is requested.
 
     Args:
         G: nx.Graph with weighted edges built from the correlation matrix.
+        n_cores: Number of processes to search with.
 
     Returns:
         Dictionary mapping (source, sink) tuples to (length, path) tuples.
     """
-    logger.info("Computing all-pairs shortest paths...")
-    all_paths = {}
-    length_paths = dict(nx.all_pairs_dijkstra_path_length(G, weight="weight"))
-    path_paths = dict(nx.all_pairs_dijkstra_path(G, weight="weight"))
+    logger.info(f"Computing all-pairs shortest paths on {n_cores} core(s)...")
 
-    for source, lengths in length_paths.items():
-        for sink, length in lengths.items():
-            if source != sink:
-                path = path_paths[source][sink]
-                all_paths[(source, sink)] = (length, path)
+    if n_cores > 1:
+        n_workers = max(1, min(n_cores, G.number_of_nodes()))
+        with ProcessPoolExecutor(
+            max_workers=n_workers,
+            initializer=_init_dijkstra_worker,
+            initargs=(G,),
+        ) as pool:
+            all_paths = _assemble_all_paths(
+                pool.map(_single_source_dijkstra, list(G.nodes()))
+            )
+    else:
+        all_paths = _assemble_all_paths(_all_pairs_dijkstra_serial(G))
 
     logger.info(f"Computed {len(all_paths)} shortest paths.")
     return all_paths
@@ -53,14 +111,15 @@ def analyze_shortest_paths(
     Returns:
         Dictionary with analysis results: average_path_length, hub_nodes,
         critical_edges, path_length_distribution, detailed_node_usage,
-        detailed_edge_usage.
+        detailed_edge_usage. The hub_nodes and critical_edges entries map each
+        identified node/edge to the number of paths it appears in.
     """
     edge_usage: Counter = Counter()
     node_usage: Counter = Counter()
     path_lengths: list[float] = []
     total_paths = len(all_paths)
 
-    for (src, sink), (length, path) in all_paths.items():
+    for length, path in all_paths.values():
         if path:
             path_lengths.append(length)
             node_usage.update(path)
@@ -91,16 +150,14 @@ def analyze_shortest_paths(
         f"avg path length {avg_path_length:.4f}"
     )
 
-    results = {
+    return {
         "average_path_length": avg_path_length,
-        "hub_nodes": list(hub_nodes.keys()),
-        "critical_edges": list(critical_edges.keys()),
+        "hub_nodes": hub_nodes,
+        "critical_edges": critical_edges,
         "path_length_distribution": path_length_distribution,
         "detailed_node_usage": node_usage,
         "detailed_edge_usage": edge_usage,
     }
-    
-    return results
 
 
 def _write_path_lengths(output_dir, avg_path_length, distribution):
@@ -136,7 +193,5 @@ def _write_critical_edges(output_dir, critical_edges):
 
 def _write_hub_nodes(output_dir, hub_nodes):
     with open(os.path.join(output_dir, "hub_nodes.txt"), "w", encoding="utf-8") as f:
-        for node, usage in sorted(
-            hub_nodes.items(), key=lambda x: x[1], reverse=True
-        ):
+        for node, usage in sorted(hub_nodes.items(), key=lambda x: x[1], reverse=True):
             f.write(f"Hub Node: {node} (usage: {usage})\n")
